@@ -132,9 +132,13 @@ class ClaudeBot:
         self.anthropic_client = anthropic.Anthropic(api_key=Config.ANTHROPIC_API_KEY)
         self.conversation_manager = ConversationManager()
         self.rate_limiter = RateLimiter()
-        
-        # Периодическая очистка данных
-        asyncio.create_task(self._periodic_cleanup())
+        self._cleanup_task = None
+    
+    async def start_cleanup_task(self):
+        """Запуск задачи очистки после инициализации event loop"""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+            logger.info("🧹 Задача периодической очистки запущена")
     
     async def _periodic_cleanup(self):
         """Периодическая очистка данных"""
@@ -149,6 +153,9 @@ class ClaudeBot:
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
+        # Запускаем cleanup task при первом использовании
+        await self.start_cleanup_task()
+        
         user_name = update.effective_user.first_name or "друг"
         welcome_message = f"""
 🤖 Привет, {user_name}! Я бот с Claude Sonnet 4! ✨
@@ -230,6 +237,9 @@ class ClaudeBot:
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка обычных сообщений"""
+        # Запускаем cleanup task при первом использовании
+        await self.start_cleanup_task()
+        
         user_id = update.effective_user.id
         user_message = update.message.text
         
