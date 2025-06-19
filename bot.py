@@ -151,7 +151,7 @@ class GeminiBot:
         ]
         
         self.model = genai.GenerativeModel(
-            model_name="gemini-2.5-pro",  # или "gemini-1.5-pro-latest"
+            model_name="gemini-2.5-pro", 
             generation_config=generation_config,
             safety_settings=safety_settings
         )
@@ -192,7 +192,7 @@ class GeminiBot:
 /help - Подробная справка
 /status - Статус бота
 
-💬 Просто напишите мне сообщение, и я отвечу с помощью Google Gemini!
+💬 Просто напишите мне сообщение, и я отвечу!
 
 ⚡ Лимит: {Config.RATE_LIMIT_REQUESTS} сообщений в {Config.RATE_LIMIT_MINUTES} мин.
         """
@@ -242,7 +242,7 @@ class GeminiBot:
         status_text = f"""
 📊 **Статус бота**
 
-🤖 Модель: Google Gemini 2.0
+🤖 Модель: gemini-2.5-pro
 🟢 Статус: Активен
 💬 Активных разговоров: {active_conversations}
 📝 Ваших сообщений в истории: {user_messages}
