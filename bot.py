@@ -1,417 +1,435 @@
 import asyncio
 import logging
 import os
-import time # Для time.monotonic() и time.sleep()
-from typing import Dict, List, Any, AsyncGenerator
-
+import json
+from typing import Dict, List, Optional
 from datetime import datetime, timedelta
-
-from telegram import Update, Message
-from telegram.constants import ParseMode
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import BadRequest
 import google.generativeai as genai
-from google.generativeai.types import GenerationConfig, SafetySetting, HarmCategory, Part, HarmBlockThreshold
-# from google.api_core.exceptions import InvalidArgument # Необязателен, т.к. есть явная проверка на пустую историю
-
 from dotenv import load_dotenv
 
-# --- Начальная настройка ---
+# Загружаем переменные окружения
 load_dotenv()
+
+# Настройка логирования для облачного хостинга
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    handlers=[logging.StreamHandler()]
+    handlers=[
+        logging.StreamHandler(),  # Вывод в консоль для Pella.app
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# --- Конфигурация ---
+# Конфигурация
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    SYSTEM_INSTRUCTION = os.getenv(
-        "SYSTEM_INSTRUCTION",
-        "Ты — дружелюбный и полезный ассистент Gemini в Telegram. Отвечай на русском языке."
-    )
-    MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "700000"))
-    MAX_CONVERSATION_MESSAGES = int(os.getenv("MAX_CONVERSATION_MESSAGES", "100"))
-    MAX_MESSAGE_LENGTH = 4096 # Лимит Telegram (пока не используется для разбивки ответа)
+    MAX_CONVERSATION_LENGTH = int(os.getenv("MAX_CONVERSATION_LENGTH", "20"))
+    MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "4000"))
     RATE_LIMIT_MINUTES = int(os.getenv("RATE_LIMIT_MINUTES", "1"))
-    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "20"))
-    GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-pro-latest")
-
+    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "15"))
+    
     @classmethod
     def validate(cls):
+        """Валидация конфигурации"""
         if not cls.TELEGRAM_BOT_TOKEN or not cls.GEMINI_API_KEY:
             raise ValueError("❌ Отсутствуют обязательные переменные окружения: TELEGRAM_BOT_TOKEN, GEMINI_API_KEY")
         logger.info("✅ Конфигурация валидна")
-        logger.info(f"Используемая модель Gemini: {cls.GEMINI_MODEL_NAME}")
-        logger.info(f"Макс. токенов контекста истории: {cls.MAX_CONTEXT_TOKENS}")
 
-# --- Управление данными ---
 class RateLimiter:
+    """Ограничитель частоты запросов"""
     def __init__(self):
         self.user_requests: Dict[int, List[datetime]] = {}
-
+    
     def is_allowed(self, user_id: int) -> bool:
+        """Проверка лимита запросов"""
         now = datetime.now()
         cutoff = now - timedelta(minutes=Config.RATE_LIMIT_MINUTES)
-        timestamps = self.user_requests.get(user_id, [])
         
-        valid_timestamps = [t for t in timestamps if t > cutoff]
+        if user_id not in self.user_requests:
+            self.user_requests[user_id] = []
         
-        if len(valid_timestamps) >= Config.RATE_LIMIT_REQUESTS:
-            self.user_requests[user_id] = valid_timestamps # Обновляем, чтобы удалить старые, даже если лимит превышен
+        # Очищаем старые запросы
+        self.user_requests[user_id] = [
+            req_time for req_time in self.user_requests[user_id] 
+            if req_time > cutoff
+        ]
+        
+        # Проверяем лимит
+        if len(self.user_requests[user_id]) >= Config.RATE_LIMIT_REQUESTS:
             return False
         
-        valid_timestamps.append(now)
-        self.user_requests[user_id] = valid_timestamps
+        # Добавляем новый запрос
+        self.user_requests[user_id].append(now)
         return True
-
+    
     def cleanup_old_data(self):
+        """Очистка старых данных для экономии памяти"""
         cutoff = datetime.now() - timedelta(hours=1)
-        users_before_cleanup = len(self.user_requests)
+        users_to_remove = []
         
-        cleaned_requests: Dict[int, List[datetime]] = {}
-        for user_id, timestamps in self.user_requests.items():
-            valid_timestamps = [t for t in timestamps if t > cutoff]
-            if valid_timestamps: # Только если остались актуальные записи
-                cleaned_requests[user_id] = valid_timestamps
+        for user_id, requests in self.user_requests.items():
+            self.user_requests[user_id] = [
+                req_time for req_time in requests if req_time > cutoff
+            ]
+            if not self.user_requests[user_id]:
+                users_to_remove.append(user_id)
         
-        self.user_requests = cleaned_requests
-        users_after_cleanup = len(self.user_requests)
-        
-        if users_before_cleanup > 0 : # Логируем, только если были пользователи для очистки
-            if users_before_cleanup != users_after_cleanup:
-                logger.info(f"🧹 RateLimiter: количество отслеживаемых пользователей изменилось с {users_before_cleanup} на {users_after_cleanup} после очистки.")
-            else:
-                 logger.info(f"🧹 RateLimiter: проверена и очищена история запросов для {users_before_cleanup} пользователей (количество пользователей не изменилось).")
-
+        for user_id in users_to_remove:
+            del self.user_requests[user_id]
 
 class ConversationManager:
+    """Менеджер разговоров с оптимизацией памяти для Gemini"""
     def __init__(self):
-        self.conversations: Dict[int, List[Dict[str, Any]]] = {}
+        self.conversations: Dict[int, List[Dict]] = {}
         self.last_activity: Dict[int, datetime] = {}
-
-    def add_message(self, user_id: int, role: str, parts: List[Part]):
+    
+    def add_message(self, user_id: int, role: str, content: str):
+        """Добавление сообщения в разговор (Gemini format)"""
         if user_id not in self.conversations:
             self.conversations[user_id] = []
-        self.conversations[user_id].append({"role": role, "parts": parts})
+        
+        # Gemini использует 'user' и 'model' роли
+        gemini_role = "user" if role == "user" else "model"
+        
+        self.conversations[user_id].append({
+            "role": gemini_role,
+            "parts": [{"text": content}]
+        })
+        
         self.last_activity[user_id] = datetime.now()
-
-        if len(self.conversations[user_id]) > Config.MAX_CONVERSATION_MESSAGES:
-            self.conversations[user_id] = self.conversations[user_id][-Config.MAX_CONVERSATION_MESSAGES:]
-
-    def get_conversation(self, user_id: int) -> List[Dict[str, Any]]:
+        
+        # Ограничиваем длину разговора
+        if len(self.conversations[user_id]) > Config.MAX_CONVERSATION_LENGTH:
+            self.conversations[user_id] = self.conversations[user_id][-Config.MAX_CONVERSATION_LENGTH:]
+    
+    def get_conversation(self, user_id: int) -> List[Dict]:
+        """Получение разговора пользователя в формате Gemini"""
         return self.conversations.get(user_id, [])
-
+    
     def clear_conversation(self, user_id: int):
+        """Очистка разговора пользователя"""
         if user_id in self.conversations:
             del self.conversations[user_id]
         if user_id in self.last_activity:
             del self.last_activity[user_id]
-        logger.info(f"🧹 История разговора для пользователя {user_id} очищена.")
-
+    
     def cleanup_inactive_conversations(self):
+        """Очистка неактивных разговоров"""
         cutoff = datetime.now() - timedelta(hours=24)
-        to_remove = [uid for uid, t in self.last_activity.items() if t < cutoff]
-        if to_remove: # Логируем только если есть что удалять
-            for uid in to_remove:
-                self.clear_conversation(uid) # clear_conversation уже логирует удаление
-            logger.info(f"🧹 ConversationManager: завершена очистка {len(to_remove)} неактивных разговоров.")
+        users_to_remove = []
+        
+        for user_id, last_time in self.last_activity.items():
+            if last_time < cutoff:
+                users_to_remove.append(user_id)
+        
+        for user_id in users_to_remove:
+            self.clear_conversation(user_id)
+        
+        logger.info(f"🧹 Очищено {len(users_to_remove)} неактивных разговоров")
 
-
-# --- Основной класс бота ---
 class GeminiBot:
     def __init__(self):
-        try:
-            genai.configure(api_key=Config.GEMINI_API_KEY)
-        except Exception as e:
-            logger.critical(f"❌ Не удалось сконфигурировать Gemini API: {e}", exc_info=True)
-            raise
-
+        # Настройка Gemini API
+        genai.configure(api_key=Config.GEMINI_API_KEY)
+        
+        # Создание модели с настройками безопасности
+        generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 40,
+            "max_output_tokens": 4000,
+        }
+        
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        ]
+        
         self.model = genai.GenerativeModel(
-            model_name=Config.GEMINI_MODEL_NAME,
-            system_instruction=Config.SYSTEM_INSTRUCTION,
-            generation_config=GenerationConfig( # type: ignore[call-arg] # MyPy может ругаться на kwargs в TypedDict-like классах
-                temperature=0.75,
-                top_p=0.95,
-                top_k=40,
-                max_output_tokens=8192,
-            ),
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            }
+            model_name="gemini-2.0-flash-exp",  # или "gemini-1.5-pro-latest"
+            generation_config=generation_config,
+            safety_settings=safety_settings
         )
+        
         self.conversation_manager = ConversationManager()
         self.rate_limiter = RateLimiter()
-        logger.info(f"🤖 Модель Gemini '{Config.GEMINI_MODEL_NAME}' инициализирована.")
-
-    async def post_init(self, application: Application):
-        asyncio.create_task(self._periodic_cleanup())
-        logger.info("🛠️ Периодическая очистка данных запущена.")
-
+        self._cleanup_task = None
+    
+    async def start_cleanup_task(self):
+        """Запуск задачи очистки после инициализации event loop"""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+            logger.info("🧹 Задача периодической очистки запущена")
+    
     async def _periodic_cleanup(self):
+        """Периодическая очистка данных"""
         while True:
-            await asyncio.sleep(3600) # Каждый час
+            await asyncio.sleep(3600)  # Каждый час
             try:
-                logger.info("⏳ Запуск периодической очистки...")
                 self.conversation_manager.cleanup_inactive_conversations()
                 self.rate_limiter.cleanup_old_data()
-                logger.info("✅ Периодическая очистка завершена.")
+                logger.info("🧹 Выполнена периодическая очистка данных")
             except Exception as e:
-                logger.error(f"❌ Ошибка при периодической очистке: {e}", exc_info=True)
-
+                logger.error(f"Ошибка при очистке данных: {e}")
+    
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message: return
-        user = update.effective_user
-        user_name = user.first_name if user else "друг"
-        await update.message.reply_text(
-            f"👋 Привет, {user_name}! Я бот на базе **Google {Config.GEMINI_MODEL_NAME}**.\n\n"
-            "Я помню большой контекст нашего разговора и могу анализировать изображения! "
-            "Просто отправь мне картинку с текстом (или без).\n\n"
-            "Используй /clear, чтобы начать разговор с чистого листа.",
-            parse_mode=ParseMode.MARKDOWN
+        """Обработчик команды /start"""
+        # Запускаем cleanup task при первом использовании
+        await self.start_cleanup_task()
+        
+        user_name = update.effective_user.first_name or "друг"
+        welcome_message = f"""
+🤖 Привет, {user_name}! Я бот с Google Gemini 2.0! ✨
+
+📋 **Доступные команды:**
+/start - Показать это сообщение
+/clear - Очистить историю разговора
+/help - Подробная справка
+/status - Статус бота
+
+💬 Просто напишите мне сообщение, и я отвечу с помощью Google Gemini!
+
+⚡ Лимит: {Config.RATE_LIMIT_REQUESTS} сообщений в {Config.RATE_LIMIT_MINUTES} мин.
+        """
+        await update.message.reply_text(welcome_message)
+        logger.info(f"👋 Новый пользователь: {update.effective_user.id}")
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /help"""
+        help_text = """
+🔧 **Подробная справка**
+
+**Команды:**
+/start - Начать работу с ботом
+/clear - Очистить историю разговора
+/help - Показать эту справку
+/status - Статус и статистика бота
+
+**Возможности:**
+• Умные ответы на любые вопросы
+• Помощь с программированием
+• Объяснение сложных концепций
+• Творческие задачи
+• Поддержка русского и английского языков
+
+**Ограничения:**
+• Максимум сообщений: {rate_limit} в {rate_minutes} мин.
+• Максимальная длина сообщения: {max_length} символов
+• История сохраняется в течение 24 часов
+
+💡 **Советы:**
+- Задавайте конкретные вопросы для лучших ответов
+- Используйте /clear если нужно сменить тему
+- Бот помнит контекст разговора
+        """.format(
+            rate_limit=Config.RATE_LIMIT_REQUESTS,
+            rate_minutes=Config.RATE_LIMIT_MINUTES,
+            max_length=Config.MAX_MESSAGE_LENGTH
         )
-
-    async def clear_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message: return
-        if update.effective_user:
-            self.conversation_manager.clear_conversation(update.effective_user.id)
-            await update.message.reply_text("✅ История разговора очищена!")
-        else:
-            logger.warning("Получена команда /clear без effective_user.")
-            await update.message.reply_text("Не удалось определить пользователя для очистки истории.")
-
-
-    async def _prune_history_by_tokens(self, user_id: int) -> List[Dict[str, Any]]:
-        history = self.conversation_manager.get_conversation(user_id)
-        if not history:
-            return []
-
-        initial_message_count = len(history)
-        current_total_tokens = 0 # Инициализируем на случай, если цикл не выполнится
-
-        while True:
-            try:
-                if not history: # Если история стала пустой в процессе обрезки
-                    current_total_tokens = 0
-                else:
-                    # model.count_tokens синхронный, оборачиваем в to_thread
-                    # В google-generativeai==0.5.0 count_tokens(empty_list) вызывает ошибку,
-                    # поэтому if not history: current_total_tokens = 0 выше это обрабатывает.
-                    token_count_response = await asyncio.to_thread(self.model.count_tokens, history)
-                    current_total_tokens = token_count_response.total_tokens
-
-            except Exception as e:
-                logger.error(f"Ошибка при подсчете токенов для user_id {user_id}: {e}", exc_info=True)
-                break # Прерываем цикл, если не можем посчитать токены, возвращаем историю как есть
-
-            if current_total_tokens <= Config.MAX_CONTEXT_TOKENS:
-                break
-
-            if len(history) > 1:
-                history.pop(0) # Удаляем самое старое сообщение
-            else: # Осталось одно сообщение, но оно все еще превышает лимит (или лимит слишком мал)
-                  # Не удаляем его, пусть модель попробует обработать или вернет ошибку.
-                logger.warning(
-                    f"История для {user_id} содержит одно сообщение ({current_total_tokens} токенов), "
-                    f"которое превышает MAX_CONTEXT_TOKENS ({Config.MAX_CONTEXT_TOKENS}) или "
-                    f"не может быть далее урезано. Отправка как есть."
-                )
-                break
-        
-        final_message_count = len(history)
-        if final_message_count < initial_message_count:
-            logger.info(
-                f"История для {user_id} урезана с {initial_message_count} до {final_message_count} сообщений. "
-                f"Токены после урезки: {current_total_tokens}."
-            )
-        
-        self.conversation_manager.conversations[user_id] = history
-        return history
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message or not update.effective_user:
-            logger.debug("Получено обновление без сообщения или пользователя.")
-            return
-
+        await update.message.reply_text(help_text)
+    
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Статус бота"""
+        active_conversations = len(self.conversation_manager.conversations)
         user_id = update.effective_user.id
-        message = update.message
+        user_messages = len(self.conversation_manager.get_conversation(user_id))
         
+        status_text = f"""
+📊 **Статус бота**
+
+🤖 Модель: Google Gemini 2.0
+🟢 Статус: Активен
+💬 Активных разговоров: {active_conversations}
+📝 Ваших сообщений в истории: {user_messages}
+
+⚙️ **Конфигурация:**
+• Лимит запросов: {Config.RATE_LIMIT_REQUESTS}/{Config.RATE_LIMIT_MINUTES}мин
+• Макс. длина сообщения: {Config.MAX_MESSAGE_LENGTH}
+• Макс. история: {Config.MAX_CONVERSATION_LENGTH} сообщений
+        """
+        await update.message.reply_text(status_text)
+    
+    async def clear_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Очистка истории разговора"""
+        user_id = update.effective_user.id
+        self.conversation_manager.clear_conversation(user_id)
+        await update.message.reply_text("✅ История разговора очищена! Можете начать с чистого листа.")
+        logger.info(f"🗑️ Пользователь {user_id} очистил историю")
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка обычных сообщений"""
+        # Запускаем cleanup task при первом использовании
+        await self.start_cleanup_task()
+        
+        user_id = update.effective_user.id
+        user_message = update.message.text
+        
+        # Проверка лимита запросов
         if not self.rate_limiter.is_allowed(user_id):
-            await message.reply_text("⏰ Превышен лимит запросов. Попробуйте чуть позже.", quote=True)
+            await update.message.reply_text(
+                f"⏰ Превышен лимит запросов! "
+                f"Максимум {Config.RATE_LIMIT_REQUESTS} сообщений в {Config.RATE_LIMIT_MINUTES} минуту. "
+                f"Попробуйте чуть позже."
+            )
             return
-
-        parts: List[Part] = []
-        text_content = ""
-
-        # Сначала извлекаем текст, потом фото. Порядок важен для Gemini.
-        if message.text:
-            text_content = message.text
         
-        if message.photo:
-            try:
-                # Изображение сначала
-                photo_file = await message.photo[-1].get_file()
-                photo_bytes = await photo_file.download_as_bytearray()
-                parts.append(Part.from_data(data=bytes(photo_bytes), mime_type="image/jpeg"))
-                
-                # Подпись к фото (если есть) добавляется как отдельная текстовая часть после изображения
-                if message.caption:
-                    text_content = message.caption # Используем caption как text_content, если он есть
-                
-                # Если был и обычный текст (маловероятно с фото, но для общности),
-                # и подпись, подпись имеет приоритет для text_content
-                # Если есть текст_контент (из message.text или message.caption) - добавляем его
-                if text_content:
-                    parts.append(Part.from_text(text_content))
-
-            except Exception as e:
-                logger.error(f"Ошибка при обработке фото для {user_id}: {e}", exc_info=True)
-                await message.reply_text("😕 Не удалось обработать изображение. Попробуйте еще раз.", quote=True)
-                return
-        elif text_content: # Только текст (если message.photo было пустым)
-            parts.append(Part.from_text(text_content))
-
-        if not parts:
-            logger.info(f"Получено пустое или неподдерживаемое сообщение от {user_id} (нет текста или фото).")
-            # Можно отправить ответ пользователю или просто проигнорировать
-            # await message.reply_text("Пожалуйста, отправьте текстовое сообщение или изображение.", quote=True)
+        # Проверка длины сообщения
+        if len(user_message) > Config.MAX_MESSAGE_LENGTH:
+            await update.message.reply_text(
+                f"📝 Сообщение слишком длинное! "
+                f"Максимум {Config.MAX_MESSAGE_LENGTH} символов. "
+                f"Ваше: {len(user_message)} символов."
+            )
             return
-
-        placeholder_message = None # Инициализируем для блока finally/except
+        
+        # Отправляем индикатор печати
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        
         try:
-            await context.bot.send_chat_action(chat_id=user_id, action="typing")
+            # Добавляем сообщение пользователя в историю
+            self.conversation_manager.add_message(user_id, "user", user_message)
             
-            self.conversation_manager.add_message(user_id, "user", parts)
-            pruned_history = await self._prune_history_by_tokens(user_id)
+            # Получаем историю разговора
+            conversation_history = self.conversation_manager.get_conversation(user_id)
             
-            # Важно: если pruned_history пуст, generate_content_async может вызвать ошибку.
-            # Но наша логика add_message + _prune_history_by_tokens должна гарантировать,
-            # что pruned_history содержит хотя бы текущее сообщение пользователя.
-            if not pruned_history:
-                logger.error(f"Критическая ошибка: pruned_history пуст для user {user_id} перед вызовом API.")
-                await message.reply_text("Произошла внутренняя ошибка с историей сообщений. Пожалуйста, /clear и попробуйте снова.", quote=True)
-                return
+            # Отправляем запрос к Gemini
+            if conversation_history:
+                # Если есть история, используем chat
+                chat = self.model.start_chat(history=conversation_history[:-1])  # Исключаем последнее сообщение
+                response = await asyncio.to_thread(
+                    chat.send_message, 
+                    user_message
+                )
+            else:
+                # Первое сообщение
+                response = await asyncio.to_thread(
+                    self.model.generate_content,
+                    user_message
+                )
+            
+            # Получаем ответ
+            gemini_response = response.text
+            
+            # Добавляем ответ в историю
+            self.conversation_manager.add_message(user_id, "assistant", gemini_response)
+            
+            # Разбиваем длинные ответы на части
+            if len(gemini_response) > Config.MAX_MESSAGE_LENGTH:
+                chunks = [
+                    gemini_response[i:i+Config.MAX_MESSAGE_LENGTH] 
+                    for i in range(0, len(gemini_response), Config.MAX_MESSAGE_LENGTH)
+                ]
+                for i, chunk in enumerate(chunks):
+                    if i > 0:
+                        await asyncio.sleep(0.5)  # Небольшая пауза между частями
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(gemini_response)
+            
+            logger.info(f"✅ Ответ отправлен пользователю {user_id}")
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            if "quota" in error_msg or "limit" in error_msg:
+                await update.message.reply_text(
+                    "⚠️ Превышен лимит запросов к Gemini API. "
+                    "Попробуйте через несколько минут."
+                )
+                logger.warning(f"Gemini quota exceeded для пользователя {user_id}")
+                
+            elif "safety" in error_msg or "blocked" in error_msg:
+                await update.message.reply_text(
+                    "🛡️ Сообщение заблокировано фильтрами безопасности. "
+                    "Попробуйте переформулировать вопрос."
+                )
+                logger.warning(f"Gemini safety filter для пользователя {user_id}")
+                
+            elif "api" in error_msg:
+                await update.message.reply_text(
+                    "❌ Ошибка Gemini API. Попробуйте позже или используйте /clear для сброса контекста."
+                )
+                logger.error(f"Gemini API error: {e}")
+                
+            else:
+                await update.message.reply_text(
+                    "❌ Произошла неожиданная ошибка. Попробуйте еще раз или используйте /clear."
+                )
+                logger.error(f"Unexpected error for user {user_id}: {e}")
 
-            placeholder_message = await message.reply_text("🧠 Думаю...", quote=True)
-            
-            response_stream = await self.model.generate_content_async(
-                contents=pruned_history, # Явно указываем параметр contents
-                stream=True
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Глобальный обработчик ошибок"""
+        logger.error(f"Update {update} caused error {context.error}")
+        
+        if update and update.message:
+            try:
+                await update.message.reply_text(
+                    "❌ Произошла ошибка. Попробуйте позже или используйте /clear для сброса."
+                )
+            except Exception:
+                pass  # Игнорируем ошибки при отправке сообщения об ошибке
+
+def create_application():
+    """Создание приложения Telegram"""
+    # Валидация конфигурации
+    Config.validate()
+    
+    # Создаем экземпляр бота
+    bot = GeminiBot()
+    
+    # Создаем приложение Telegram с оптимизированными настройками
+    application = (Application.builder()
+                  .token(Config.TELEGRAM_BOT_TOKEN)
+                  .concurrent_updates(True)  # Параллельная обработка
+                  .build())
+    
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("start", bot.start_command))
+    application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(CommandHandler("status", bot.status_command))
+    application.add_handler(CommandHandler("clear", bot.clear_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    
+    # Добавляем обработчик ошибок
+    application.add_error_handler(bot.error_handler)
+    
+    return application
+
+def main():
+    """Главная функция запуска бота"""
+    try:
+        logger.info("🚀 Запуск Gemini Telegram Bot...")
+        
+        # Создаем приложение
+        application = create_application()
+        
+        # Определяем режим запуска (для Pella.app используется polling)
+        port = int(os.getenv("PORT", "8080"))
+        
+        if os.getenv("PELLA_APP") == "true":
+            # Режим для Pella.app
+            logger.info(f"🌐 Запуск в режиме Pella.app на порту {port}")
+            application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                close_loop=False
+            )
+        else:
+            # Локальный режим
+            logger.info("💻 Запуск в локальном режиме")
+            application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
             )
             
-            await self._stream_and_edit_message(response_stream, placeholder_message, user_id)
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка при обработке сообщения для {user_id}: {e}", exc_info=True)
-            error_message_text = "❌ Произошла ошибка при обработке вашего запроса."
-            # Попытка определить специфичные ошибки Gemini
-            str_e = str(e).lower()
-            if "safety setting" in str_e or "blocked" in str_e or "permission_denied" in str_e or "resource_exhausted" in str_e: # Общие маркеры проблем с API
-                error_message_text = "К сожалению, я не могу ответить на этот запрос из-за ограничений или временных проблем с доступом. Попробуйте переформулировать или /clear."
-            elif "quota" in str_e:
-                error_message_text = " достигнут лимит запросов к API Gemini. Пожалуйста, попробуйте позже."
-            
-            try:
-                if placeholder_message:
-                    await placeholder_message.edit_text(error_message_text)
-                else:
-                    await message.reply_text(error_message_text, quote=True)
-            except Exception as send_error:
-                 logger.error(f"❌ Не удалось отправить/отредактировать сообщение об ошибке пользователю {user_id}: {send_error}")
-
-
-    async def _stream_and_edit_message(self, stream: AsyncGenerator, tg_message: Message, user_id: int):
-        full_response = ""
-        buffer = ""
-        last_edit_time = time.monotonic()
-        edit_interval = 1.2  # секунды
-        min_buffer_len_for_edit = 50 
-
-        try:
-            async for chunk in stream:
-                # Безопасное получение текста из чанка (вдруг чанк без .text)
-                text_part = getattr(chunk, 'text', None)
-                if text_part:
-                    buffer += text_part
-                    full_response += text_part
-                
-                current_time = time.monotonic()
-                if (current_time - last_edit_time > edit_interval and buffer) or len(buffer) >= min_buffer_len_for_edit :
-                    if not buffer.strip() and not full_response.strip(): # Не редактируем, если пока только пробелы
-                        continue
-                    try:
-                        await tg_message.edit_text(full_response + "█", parse_mode=ParseMode.MARKDOWN)
-                        last_edit_time = current_time
-                        buffer = "" # Сбрасываем буфер после успешного редактирования
-                    except BadRequest as e:
-                        if "Message is not modified" not in str(e).lower(): # Игнорируем только эту ошибку
-                            logger.warning(f"Ошибка BadRequest при редактировании сообщения (user {user_id}): {e} | Текст: '{full_response + '█'}'")
-                        # Если сообщение не изменилось, сбрасывать буфер не нужно, чтобы не потерять текст
-                    except Exception as e:
-                        logger.warning(f"Ошибка при редактировании сообщения (user {user_id}): {e}")
-            
-            # Финальное редактирование
-            if full_response.strip(): # Отправляем, только если есть непустой текст
-                try:
-                    await tg_message.edit_text(full_response, parse_mode=ParseMode.MARKDOWN)
-                except BadRequest as e:
-                    if "Message is not modified" not in str(e).lower():
-                        logger.warning(f"Ошибка BadRequest при финальном редактировании (user {user_id}): {e} | Текст: '{full_response}'")
-                except Exception as e:
-                     logger.warning(f"Ошибка при финальном редактировании (user {user_id}): {e}")
-                self.conversation_manager.add_message(user_id, "model", [Part.from_text(full_response)])
-            elif not full_response and getattr(stream, '_done_iterating', False) : # Стрим завершился, но ответа нет
-                logger.info(f"Модель вернула пустой ответ (или только safety) для user {user_id}.")
-                await tg_message.edit_text("😕 Ответ не был получен или был отфильтрован.", parse_mode=ParseMode.MARKDOWN)
-            # Если full_response пустой, но стрим не завершился (ошибка в цикле), то ничего не делаем здесь,
-            # ошибка должна была быть обработана выше.
-
-        except Exception as e: # Ошибка в самом процессе стриминга (например, обрыв соединения с API)
-            logger.error(f"❌ Ошибка в процессе получения или обработки стрима ответа для user {user_id}: {e}", exc_info=True)
-            try:
-                # Если был какой-то частичный ответ, можно его показать
-                error_display_text = "❌ Произошла ошибка при получении полного ответа."
-                if full_response.strip():
-                    error_display_text += f"\nЧастичный ответ:\n{full_response[:1000]}" # Показать часть, если есть
-                await tg_message.edit_text(error_display_text, parse_mode=ParseMode.MARKDOWN)
-            except Exception as final_edit_error:
-                logger.error(f"❌ Не удалось обновить сообщение об ошибке стриминга для user {user_id}: {final_edit_error}")
-
-
-# --- Запуск бота ---
-def main():
-    try:
-        logger.info(f"🚀 Запуск {Config.GEMINI_MODEL_NAME} Telegram Bot...")
-        Config.validate()
-        
-        bot_instance = GeminiBot()
-        
-        application = (Application.builder()
-                       .token(Config.TELEGRAM_BOT_TOKEN) # type: ignore[arg-type]
-                       .concurrent_updates(10) # Можно настроить количество параллельных обработчиков
-                       .post_init(bot_instance.post_init)
-                       .build())
-        
-        application.add_handler(MessageHandler(
-            (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
-            bot_instance.handle_message
-        ))
-        application.add_handler(CommandHandler("start", bot_instance.start_command))
-        application.add_handler(CommandHandler("clear", bot_instance.clear_command))
-        
-        logger.info("🤖 Бот готов к работе. Запуск polling...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-            
-    except ValueError as ve:
-        logger.critical(f"❌ Ошибка конфигурации: {ve}", exc_info=True)
     except Exception as e:
-        logger.critical(f"❌ Критическая ошибка при запуске бота: {e}", exc_info=True)
+        logger.error(f"❌ Критическая ошибка при запуске: {e}")
+        raise
 
 if __name__ == '__main__':
     main()
