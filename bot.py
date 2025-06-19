@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import anthropic
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения
@@ -25,17 +25,17 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     MAX_CONVERSATION_LENGTH = int(os.getenv("MAX_CONVERSATION_LENGTH", "20"))
     MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "4000"))
     RATE_LIMIT_MINUTES = int(os.getenv("RATE_LIMIT_MINUTES", "1"))
-    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "10"))
+    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "15"))
     
     @classmethod
     def validate(cls):
         """Валидация конфигурации"""
-        if not cls.TELEGRAM_BOT_TOKEN or not cls.ANTHROPIC_API_KEY:
-            raise ValueError("❌ Отсутствуют обязательные переменные окружения: TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY")
+        if not cls.TELEGRAM_BOT_TOKEN or not cls.GEMINI_API_KEY:
+            raise ValueError("❌ Отсутствуют обязательные переменные окружения: TELEGRAM_BOT_TOKEN, GEMINI_API_KEY")
         logger.info("✅ Конфигурация валидна")
 
 class RateLimiter:
@@ -81,19 +81,22 @@ class RateLimiter:
             del self.user_requests[user_id]
 
 class ConversationManager:
-    """Менеджер разговоров с оптимизацией памяти"""
+    """Менеджер разговоров с оптимизацией памяти для Gemini"""
     def __init__(self):
         self.conversations: Dict[int, List[Dict]] = {}
         self.last_activity: Dict[int, datetime] = {}
     
     def add_message(self, user_id: int, role: str, content: str):
-        """Добавление сообщения в разговор"""
+        """Добавление сообщения в разговор (Gemini format)"""
         if user_id not in self.conversations:
             self.conversations[user_id] = []
         
+        # Gemini использует 'user' и 'model' роли
+        gemini_role = "user" if role == "user" else "model"
+        
         self.conversations[user_id].append({
-            "role": role,
-            "content": content
+            "role": gemini_role,
+            "parts": [{"text": content}]
         })
         
         self.last_activity[user_id] = datetime.now()
@@ -103,7 +106,7 @@ class ConversationManager:
             self.conversations[user_id] = self.conversations[user_id][-Config.MAX_CONVERSATION_LENGTH:]
     
     def get_conversation(self, user_id: int) -> List[Dict]:
-        """Получение разговора пользователя"""
+        """Получение разговора пользователя в формате Gemini"""
         return self.conversations.get(user_id, [])
     
     def clear_conversation(self, user_id: int):
@@ -127,9 +130,32 @@ class ConversationManager:
         
         logger.info(f"🧹 Очищено {len(users_to_remove)} неактивных разговоров")
 
-class ClaudeBot:
+class GeminiBot:
     def __init__(self):
-        self.anthropic_client = anthropic.Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+        # Настройка Gemini API
+        genai.configure(api_key=Config.GEMINI_API_KEY)
+        
+        # Создание модели с настройками безопасности
+        generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 40,
+            "max_output_tokens": 4000,
+        }
+        
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        ]
+        
+        self.model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash-exp",  # или "gemini-1.5-pro-latest"
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        
         self.conversation_manager = ConversationManager()
         self.rate_limiter = RateLimiter()
         self._cleanup_task = None
@@ -158,7 +184,7 @@ class ClaudeBot:
         
         user_name = update.effective_user.first_name or "друг"
         welcome_message = f"""
-🤖 Привет, {user_name}! Я бот с Claude Sonnet 4! ✨
+🤖 Привет, {user_name}! Я бот с Google Gemini 2.0! ✨
 
 📋 **Доступные команды:**
 /start - Показать это сообщение
@@ -166,7 +192,7 @@ class ClaudeBot:
 /help - Подробная справка
 /status - Статус бота
 
-💬 Просто напишите мне сообщение, и я отвечу с помощью Claude Sonnet 4!
+💬 Просто напишите мне сообщение, и я отвечу с помощью Google Gemini!
 
 ⚡ Лимит: {Config.RATE_LIMIT_REQUESTS} сообщений в {Config.RATE_LIMIT_MINUTES} мин.
         """
@@ -216,7 +242,7 @@ class ClaudeBot:
         status_text = f"""
 📊 **Статус бота**
 
-🤖 Модель: Claude Sonnet 4
+🤖 Модель: Google Gemini 2.0
 🟢 Статус: Активен
 💬 Активных разговоров: {active_conversations}
 📝 Ваших сообщений в истории: {user_messages}
@@ -269,56 +295,72 @@ class ClaudeBot:
             self.conversation_manager.add_message(user_id, "user", user_message)
             
             # Получаем историю разговора
-            conversation = self.conversation_manager.get_conversation(user_id)
+            conversation_history = self.conversation_manager.get_conversation(user_id)
             
-            # Отправляем запрос к Claude
-            response = await asyncio.to_thread(
-                self.anthropic_client.messages.create,
-                model="claude-sonnet-4-20250514",
-                max_tokens=4000,
-                messages=conversation,
-                temperature=0.7
-            )
+            # Отправляем запрос к Gemini
+            if conversation_history:
+                # Если есть история, используем chat
+                chat = self.model.start_chat(history=conversation_history[:-1])  # Исключаем последнее сообщение
+                response = await asyncio.to_thread(
+                    chat.send_message, 
+                    user_message
+                )
+            else:
+                # Первое сообщение
+                response = await asyncio.to_thread(
+                    self.model.generate_content,
+                    user_message
+                )
             
             # Получаем ответ
-            claude_response = response.content[0].text
+            gemini_response = response.text
             
             # Добавляем ответ в историю
-            self.conversation_manager.add_message(user_id, "assistant", claude_response)
+            self.conversation_manager.add_message(user_id, "assistant", gemini_response)
             
             # Разбиваем длинные ответы на части
-            if len(claude_response) > Config.MAX_MESSAGE_LENGTH:
+            if len(gemini_response) > Config.MAX_MESSAGE_LENGTH:
                 chunks = [
-                    claude_response[i:i+Config.MAX_MESSAGE_LENGTH] 
-                    for i in range(0, len(claude_response), Config.MAX_MESSAGE_LENGTH)
+                    gemini_response[i:i+Config.MAX_MESSAGE_LENGTH] 
+                    for i in range(0, len(gemini_response), Config.MAX_MESSAGE_LENGTH)
                 ]
                 for i, chunk in enumerate(chunks):
                     if i > 0:
                         await asyncio.sleep(0.5)  # Небольшая пауза между частями
                     await update.message.reply_text(chunk)
             else:
-                await update.message.reply_text(claude_response)
+                await update.message.reply_text(gemini_response)
             
             logger.info(f"✅ Ответ отправлен пользователю {user_id}")
             
-        except anthropic.RateLimitError:
-            await update.message.reply_text(
-                "⚠️ Превышен лимит запросов к Claude API. "
-                "Попробуйте через несколько минут."
-            )
-            logger.warning(f"Rate limit для пользователя {user_id}")
-            
-        except anthropic.APIError as e:
-            await update.message.reply_text(
-                f"❌ Ошибка Claude API. Попробуйте позже или используйте /clear для сброса контекста."
-            )
-            logger.error(f"Claude API error: {e}")
-            
         except Exception as e:
-            await update.message.reply_text(
-                "❌ Произошла неожиданная ошибка. Попробуйте еще раз или используйте /clear."
-            )
-            logger.error(f"Unexpected error for user {user_id}: {e}")
+            error_msg = str(e).lower()
+            
+            if "quota" in error_msg or "limit" in error_msg:
+                await update.message.reply_text(
+                    "⚠️ Превышен лимит запросов к Gemini API. "
+                    "Попробуйте через несколько минут."
+                )
+                logger.warning(f"Gemini quota exceeded для пользователя {user_id}")
+                
+            elif "safety" in error_msg or "blocked" in error_msg:
+                await update.message.reply_text(
+                    "🛡️ Сообщение заблокировано фильтрами безопасности. "
+                    "Попробуйте переформулировать вопрос."
+                )
+                logger.warning(f"Gemini safety filter для пользователя {user_id}")
+                
+            elif "api" in error_msg:
+                await update.message.reply_text(
+                    "❌ Ошибка Gemini API. Попробуйте позже или используйте /clear для сброса контекста."
+                )
+                logger.error(f"Gemini API error: {e}")
+                
+            else:
+                await update.message.reply_text(
+                    "❌ Произошла неожиданная ошибка. Попробуйте еще раз или используйте /clear."
+                )
+                logger.error(f"Unexpected error for user {user_id}: {e}")
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Глобальный обработчик ошибок"""
@@ -338,7 +380,7 @@ def create_application():
     Config.validate()
     
     # Создаем экземпляр бота
-    bot = ClaudeBot()
+    bot = GeminiBot()
     
     # Создаем приложение Telegram с оптимизированными настройками
     application = (Application.builder()
@@ -361,7 +403,7 @@ def create_application():
 def main():
     """Главная функция запуска бота"""
     try:
-        logger.info("🚀 Запуск Claude Telegram Bot...")
+        logger.info("🚀 Запуск Gemini Telegram Bot...")
         
         # Создаем приложение
         application = create_application()
