@@ -33,7 +33,7 @@ class ClaudeBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
         welcome_message = """
-🤖 Привет! Я бот с Claude Sonnet 4!
+🤖 Привет! Я бот с Claude Sonnet 4! ♥
 
 Доступные команды:
 /start - Показать это сообщение
