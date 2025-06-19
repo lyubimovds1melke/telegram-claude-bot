@@ -92,7 +92,7 @@ class ClaudeBot:
             
             # Отправляем запрос к Claude
             response = anthropic_client.messages.create(
-                model="claude-3-5-sonnet-20241022", # model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-20250514",
                 max_tokens=10000
                 messages=self.user_conversations[user_id]
             )
