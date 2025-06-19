@@ -1,8 +1,7 @@
 import asyncio
 import logging
 import os
-import json
-from typing import Dict, List, Optional
+from typing import Dict, List
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -17,12 +16,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
     handlers=[
-        logging.StreamHandler(),  # Вывод в консоль для Pella.app
+        logging.StreamHandler(),  # Вывод в консоль
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация
+# --- Конфигурация ---
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -30,7 +29,7 @@ class Config:
     MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "4000"))
     RATE_LIMIT_MINUTES = int(os.getenv("RATE_LIMIT_MINUTES", "1"))
     RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "15"))
-    
+
     @classmethod
     def validate(cls):
         """Валидация конфигурации"""
@@ -38,54 +37,55 @@ class Config:
             raise ValueError("❌ Отсутствуют обязательные переменные окружения: TELEGRAM_BOT_TOKEN, GEMINI_API_KEY")
         logger.info("✅ Конфигурация валидна")
 
+# --- Ограничитель частоты запросов ---
 class RateLimiter:
     """Ограничитель частоты запросов"""
     def __init__(self):
         self.user_requests: Dict[int, List[datetime]] = {}
-    
+
     def is_allowed(self, user_id: int) -> bool:
         """Проверка лимита запросов"""
         now = datetime.now()
         cutoff = now - timedelta(minutes=Config.RATE_LIMIT_MINUTES)
         
-        if user_id not in self.user_requests:
-            self.user_requests[user_id] = []
+        user_timestamps = self.user_requests.get(user_id, [])
         
         # Очищаем старые запросы
-        self.user_requests[user_id] = [
-            req_time for req_time in self.user_requests[user_id] 
-            if req_time > cutoff
-        ]
+        valid_timestamps = [t for t in user_timestamps if t > cutoff]
         
         # Проверяем лимит
-        if len(self.user_requests[user_id]) >= Config.RATE_LIMIT_REQUESTS:
+        if len(valid_timestamps) >= Config.RATE_LIMIT_REQUESTS:
+            self.user_requests[user_id] = valid_timestamps
             return False
         
         # Добавляем новый запрос
-        self.user_requests[user_id].append(now)
+        valid_timestamps.append(now)
+        self.user_requests[user_id] = valid_timestamps
         return True
-    
+
     def cleanup_old_data(self):
         """Очистка старых данных для экономии памяти"""
         cutoff = datetime.now() - timedelta(hours=1)
         users_to_remove = []
         
         for user_id, requests in self.user_requests.items():
-            self.user_requests[user_id] = [
-                req_time for req_time in requests if req_time > cutoff
-            ]
-            if not self.user_requests[user_id]:
+            valid_requests = [req_time for req_time in requests if req_time > cutoff]
+            if not valid_requests:
                 users_to_remove.append(user_id)
+            else:
+                self.user_requests[user_id] = valid_requests
         
         for user_id in users_to_remove:
             del self.user_requests[user_id]
+        logger.info(f"🧹 RateLimiter: Очищено данных для {len(users_to_remove)} пользователей.")
 
+# --- Менеджер разговоров ---
 class ConversationManager:
     """Менеджер разговоров с оптимизацией памяти для Gemini"""
     def __init__(self):
         self.conversations: Dict[int, List[Dict]] = {}
         self.last_activity: Dict[int, datetime] = {}
-    
+
     def add_message(self, user_id: int, role: str, content: str):
         """Добавление сообщения в разговор (Gemini format)"""
         if user_id not in self.conversations:
@@ -104,43 +104,42 @@ class ConversationManager:
         # Ограничиваем длину разговора
         if len(self.conversations[user_id]) > Config.MAX_CONVERSATION_LENGTH:
             self.conversations[user_id] = self.conversations[user_id][-Config.MAX_CONVERSATION_LENGTH:]
-    
+
     def get_conversation(self, user_id: int) -> List[Dict]:
         """Получение разговора пользователя в формате Gemini"""
         return self.conversations.get(user_id, [])
-    
+
     def clear_conversation(self, user_id: int):
         """Очистка разговора пользователя"""
         if user_id in self.conversations:
             del self.conversations[user_id]
         if user_id in self.last_activity:
             del self.last_activity[user_id]
-    
+
     def cleanup_inactive_conversations(self):
         """Очистка неактивных разговоров"""
         cutoff = datetime.now() - timedelta(hours=24)
-        users_to_remove = []
-        
-        for user_id, last_time in self.last_activity.items():
-            if last_time < cutoff:
-                users_to_remove.append(user_id)
+        users_to_remove = [
+            user_id for user_id, last_time in self.last_activity.items() if last_time < cutoff
+        ]
         
         for user_id in users_to_remove:
             self.clear_conversation(user_id)
         
-        logger.info(f"🧹 Очищено {len(users_to_remove)} неактивных разговоров")
+        if users_to_remove:
+            logger.info(f"🧹 ConversationManager: Очищено {len(users_to_remove)} неактивных разговоров.")
 
+# --- Основной класс бота ---
 class GeminiBot:
     def __init__(self):
         # Настройка Gemini API
         genai.configure(api_key=Config.GEMINI_API_KEY)
         
-        # Создание модели с настройками безопасности
         generation_config = {
             "temperature": 0.7,
             "top_p": 0.95,
             "top_k": 40,
-            "max_output_tokens": 4000,
+            "max_output_tokens": 4096, # Увеличил для соответствия модели
         }
         
         safety_settings = [
@@ -150,41 +149,37 @@ class GeminiBot:
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
         ]
         
+        # Использование более стабильной и распространенной модели
         self.model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash-exp",  # или "gemini-1.5-pro-latest"
+            model_name="gemini-1.5-flash-latest",
             generation_config=generation_config,
             safety_settings=safety_settings
         )
         
         self.conversation_manager = ConversationManager()
         self.rate_limiter = RateLimiter()
-        self._cleanup_task = None
-    
-    async def start_cleanup_task(self):
-        """Запуск задачи очистки после инициализации event loop"""
-        if self._cleanup_task is None:
-            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-            logger.info("🧹 Задача периодической очистки запущена")
+
+    async def post_init(self, application: Application):
+        """Запускает фоновую задачу после инициализации приложения."""
+        asyncio.create_task(self._periodic_cleanup())
+        logger.info("✅ Бот инициализирован, фоновая задача очистки запущена.")
     
     async def _periodic_cleanup(self):
-        """Периодическая очистка данных"""
+        """Периодическая очистка данных в фоне."""
         while True:
             await asyncio.sleep(3600)  # Каждый час
             try:
                 self.conversation_manager.cleanup_inactive_conversations()
                 self.rate_limiter.cleanup_old_data()
-                logger.info("🧹 Выполнена периодическая очистка данных")
+                logger.info("🧹 Выполнена периодическая очистка данных.")
             except Exception as e:
-                logger.error(f"Ошибка при очистке данных: {e}")
+                logger.error(f"❌ Ошибка при периодической очистке: {e}")
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
-        # Запускаем cleanup task при первом использовании
-        await self.start_cleanup_task()
-        
         user_name = update.effective_user.first_name or "друг"
         welcome_message = f"""
-🤖 Привет, {user_name}! Я бот с Google Gemini 2.0! ✨
+🤖 Привет, {user_name}! Я бот с Google Gemini! ✨
 
 📋 **Доступные команды:**
 /start - Показать это сообщение
@@ -197,11 +192,11 @@ class GeminiBot:
 ⚡ Лимит: {Config.RATE_LIMIT_REQUESTS} сообщений в {Config.RATE_LIMIT_MINUTES} мин.
         """
         await update.message.reply_text(welcome_message)
-        logger.info(f"👋 Новый пользователь: {update.effective_user.id}")
+        logger.info(f"👋 Новый пользователь: {update.effective_user.id} ({update.effective_user.username})")
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /help"""
-        help_text = """
+        help_text = f"""
 🔧 **Подробная справка**
 
 **Команды:**
@@ -218,19 +213,15 @@ class GeminiBot:
 • Поддержка русского и английского языков
 
 **Ограничения:**
-• Максимум сообщений: {rate_limit} в {rate_minutes} мин.
-• Максимальная длина сообщения: {max_length} символов
+• Максимум сообщений: {Config.RATE_LIMIT_REQUESTS} в {Config.RATE_LIMIT_MINUTES} мин.
+• Максимальная длина сообщения: {Config.MAX_MESSAGE_LENGTH} символов
 • История сохраняется в течение 24 часов
 
 💡 **Советы:**
 - Задавайте конкретные вопросы для лучших ответов
 - Используйте /clear если нужно сменить тему
-- Бот помнит контекст разговора
-        """.format(
-            rate_limit=Config.RATE_LIMIT_REQUESTS,
-            rate_minutes=Config.RATE_LIMIT_MINUTES,
-            max_length=Config.MAX_MESSAGE_LENGTH
-        )
+- Бот помнит контекст разговора (последние {Config.MAX_CONVERSATION_LENGTH} сообщений)
+        """
         await update.message.reply_text(help_text)
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -242,13 +233,13 @@ class GeminiBot:
         status_text = f"""
 📊 **Статус бота**
 
-🤖 Модель: Google Gemini 2.0
+🤖 Модель: {self.model.model_name}
 🟢 Статус: Активен
 💬 Активных разговоров: {active_conversations}
 📝 Ваших сообщений в истории: {user_messages}
 
 ⚙️ **Конфигурация:**
-• Лимит запросов: {Config.RATE_LIMIT_REQUESTS}/{Config.RATE_LIMIT_MINUTES}мин
+• Лимит запросов: {Config.RATE_LIMIT_REQUESTS}/{Config.RATE_LIMIT_MINUTES} мин
 • Макс. длина сообщения: {Config.MAX_MESSAGE_LENGTH}
 • Макс. история: {Config.MAX_CONVERSATION_LENGTH} сообщений
         """
@@ -263,17 +254,17 @@ class GeminiBot:
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка обычных сообщений"""
-        # Запускаем cleanup task при первом использовании
-        await self.start_cleanup_task()
-        
         user_id = update.effective_user.id
         user_message = update.message.text
         
+        if not user_message:
+            return
+
         # Проверка лимита запросов
         if not self.rate_limiter.is_allowed(user_id):
             await update.message.reply_text(
                 f"⏰ Превышен лимит запросов! "
-                f"Максимум {Config.RATE_LIMIT_REQUESTS} сообщений в {Config.RATE_LIMIT_MINUTES} минуту. "
+                f"Максимум {Config.RATE_LIMIT_REQUESTS} сообщений за {Config.RATE_LIMIT_MINUTES} мин. "
                 f"Попробуйте чуть позже."
             )
             return
@@ -287,47 +278,30 @@ class GeminiBot:
             )
             return
         
-        # Отправляем индикатор печати
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
         try:
             # Добавляем сообщение пользователя в историю
             self.conversation_manager.add_message(user_id, "user", user_message)
-            
-            # Получаем историю разговора
             conversation_history = self.conversation_manager.get_conversation(user_id)
             
-            # Отправляем запрос к Gemini
-            if conversation_history:
-                # Если есть история, используем chat
-                chat = self.model.start_chat(history=conversation_history[:-1])  # Исключаем последнее сообщение
-                response = await asyncio.to_thread(
-                    chat.send_message, 
-                    user_message
-                )
-            else:
-                # Первое сообщение
-                response = await asyncio.to_thread(
-                    self.model.generate_content,
-                    user_message
-                )
+            # Упрощенный и более надежный вызов API
+            response = await asyncio.to_thread(
+                self.model.generate_content,
+                conversation_history
+            )
             
-            # Получаем ответ
             gemini_response = response.text
             
             # Добавляем ответ в историю
-            self.conversation_manager.add_message(user_id, "assistant", gemini_response)
+            self.conversation_manager.add_message(user_id, "model", gemini_response)
             
             # Разбиваем длинные ответы на части
             if len(gemini_response) > Config.MAX_MESSAGE_LENGTH:
-                chunks = [
-                    gemini_response[i:i+Config.MAX_MESSAGE_LENGTH] 
-                    for i in range(0, len(gemini_response), Config.MAX_MESSAGE_LENGTH)
-                ]
-                for i, chunk in enumerate(chunks):
-                    if i > 0:
-                        await asyncio.sleep(0.5)  # Небольшая пауза между частями
+                for i in range(0, len(gemini_response), Config.MAX_MESSAGE_LENGTH):
+                    chunk = gemini_response[i:i+Config.MAX_MESSAGE_LENGTH]
                     await update.message.reply_text(chunk)
+                    await asyncio.sleep(0.5)
             else:
                 await update.message.reply_text(gemini_response)
             
@@ -335,101 +309,63 @@ class GeminiBot:
             
         except Exception as e:
             error_msg = str(e).lower()
+            logger.error(f"❌ Ошибка при обработке сообщения для {user_id}: {e}", exc_info=True)
             
             if "quota" in error_msg or "limit" in error_msg:
-                await update.message.reply_text(
-                    "⚠️ Превышен лимит запросов к Gemini API. "
-                    "Попробуйте через несколько минут."
-                )
-                logger.warning(f"Gemini quota exceeded для пользователя {user_id}")
-                
+                reply = "⚠️ Превышен лимит запросов к Gemini API. Попробуйте через несколько минут."
             elif "safety" in error_msg or "blocked" in error_msg:
-                await update.message.reply_text(
-                    "🛡️ Сообщение заблокировано фильтрами безопасности. "
-                    "Попробуйте переформулировать вопрос."
-                )
-                logger.warning(f"Gemini safety filter для пользователя {user_id}")
-                
-            elif "api" in error_msg:
-                await update.message.reply_text(
-                    "❌ Ошибка Gemini API. Попробуйте позже или используйте /clear для сброса контекста."
-                )
-                logger.error(f"Gemini API error: {e}")
-                
+                reply = "🛡️ Ваш запрос или ответ были заблокированы фильтрами безопасности. Попробуйте переформулировать."
+            elif "api" in error_msg or "key" in error_msg:
+                reply = "❌ Ошибка конфигурации Gemini API. Возможно, неверный ключ."
             else:
-                await update.message.reply_text(
-                    "❌ Произошла неожиданная ошибка. Попробуйте еще раз или используйте /clear."
-                )
-                logger.error(f"Unexpected error for user {user_id}: {e}")
+                reply = "❌ Произошла неожиданная ошибка. Попробуйте еще раз или используйте /clear для сброса контекста."
+            
+            await update.message.reply_text(reply)
 
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         """Глобальный обработчик ошибок"""
-        logger.error(f"Update {update} caused error {context.error}")
+        logger.error(f"Исключение при обработке апдейта {update}:", exc_info=context.error)
         
-        if update and update.message:
+        if isinstance(update, Update) and update.effective_message:
             try:
-                await update.message.reply_text(
-                    "❌ Произошла ошибка. Попробуйте позже или используйте /clear для сброса."
+                await update.effective_message.reply_text(
+                    "❌ Произошла внутренняя ошибка. Попробуйте позже или используйте /clear для сброса."
                 )
-            except Exception:
-                pass  # Игнорируем ошибки при отправке сообщения об ошибке
+            except Exception as e:
+                logger.error(f"Не удалось отправить сообщение об ошибке пользователю: {e}")
 
-def create_application():
-    """Создание приложения Telegram"""
-    # Валидация конфигурации
-    Config.validate()
-    
-    # Создаем экземпляр бота
-    bot = GeminiBot()
-    
-    # Создаем приложение Telegram с оптимизированными настройками
-    application = (Application.builder()
-                  .token(Config.TELEGRAM_BOT_TOKEN)
-                  .concurrent_updates(True)  # Параллельная обработка
-                  .build())
-    
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", bot.start_command))
-    application.add_handler(CommandHandler("help", bot.help_command))
-    application.add_handler(CommandHandler("status", bot.status_command))
-    application.add_handler(CommandHandler("clear", bot.clear_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
-    # Добавляем обработчик ошибок
-    application.add_error_handler(bot.error_handler)
-    
-    return application
-
+# --- Запуск бота ---
 def main():
     """Главная функция запуска бота"""
     try:
         logger.info("🚀 Запуск Gemini Telegram Bot...")
         
-        # Создаем приложение
-        application = create_application()
+        Config.validate()
+        bot = GeminiBot()
         
-        # Определяем режим запуска (для Pella.app используется polling)
-        port = int(os.getenv("PORT", "8080"))
+        application = (Application.builder()
+                       .token(Config.TELEGRAM_BOT_TOKEN)
+                       .concurrent_updates(True)
+                       .post_init(bot.post_init) # Правильный запуск фоновых задач
+                       .build())
         
-        if os.getenv("PELLA_APP") == "true":
-            # Режим для Pella.app
-            logger.info(f"🌐 Запуск в режиме Pella.app на порту {port}")
-            application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                close_loop=False
-            )
-        else:
-            # Локальный режим
-            logger.info("💻 Запуск в локальном режиме")
-            application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
-            )
+        application.add_handler(CommandHandler("start", bot.start_command))
+        application.add_handler(CommandHandler("help", bot.help_command))
+        application.add_handler(CommandHandler("status", bot.status_command))
+        application.add_handler(CommandHandler("clear", bot.clear_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+        
+        application.add_error_handler(bot.error_handler)
+        
+        logger.info("🤖 Бот готов к работе. Запуск polling...")
+        # Этот метод подходит и для локального запуска, и для многих облачных сервисов,
+        # которые не требуют веб-сервера (например, Pella.app).
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
             
+    except (ValueError, KeyError) as e:
+        logger.critical(f"❌ Критическая ошибка конфигурации: {e}")
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка при запуске: {e}")
-        raise
+        logger.critical(f"❌ Критическая ошибка при запуске бота: {e}", exc_info=True)
 
 if __name__ == '__main__':
     main()
